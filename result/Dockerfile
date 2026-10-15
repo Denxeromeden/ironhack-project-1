@@ -1,14 +1,10 @@
-FROM node:18-slim
+FROM node:26-trixie-slim@sha256:d844f1e8928a5c77d26cb8ed37d7425e27014aff39d10f4194716c215fef7398
 
-# add curl for healthcheck
 RUN apt-get update && \
     apt-get install -y --no-install-recommends curl tini && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /usr/local/app
-
-# have nodemon available for local dev use (file watching)
-RUN npm install -g nodemon
 
 COPY package*.json ./
 
@@ -18,7 +14,6 @@ RUN npm ci && \
 
 COPY . .
 
-# Set default environment variables for both the application and PostgreSQL connection
 ENV PORT=80 \
     PG_HOST=db \
     PG_PORT=5432 \

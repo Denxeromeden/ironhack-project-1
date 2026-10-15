@@ -1,0 +1,57 @@
+global
+    log stdout format raw local0
+    maxconn 2048
+
+defaults
+    log global
+    mode tcp
+    option tcplog
+    option tcpka
+    timeout connect 5s
+    timeout client 1m
+    timeout server 1m
+    timeout check 5s
+    retries 3
+
+# Applications connect here. HAProxy forwards TCP to the only PostgreSQL node
+# whose Patroni REST API returns HTTP 200 for /primary.
+frontend postgres_write
+    bind {{ haproxy_listen_address | default("0.0.0.0") }}:{{ pg_port | default(5432) }}
+    default_backend postgres_primary
+
+backend postgres_primary
+    mode tcp
+    option httpchk GET /primary
+    http-check expect status 200
+{% for host in groups['database'] %}
+    server {{ host | regex_replace('[^A-Za-z0-9_-]', '_') }} {{ hostvars[host].ip }}:{{ pg_port | default(5432) }} check port {{ patroni_rest_port | default(8008) }} inter 2s fall 3 rise 2 on-marked-down shutdown-sessions
+{% endfor %}
+
+{% if haproxy_enable_read_endpoint | default(false) %}
+# Optional replica-only endpoint. Enable only if result queries tolerate async
+# replication lag. /replica?replication_state=streaming excludes the primary and
+# replicas that are not yet streaming.
+frontend postgres_read
+    bind {{ haproxy_listen_address | default("0.0.0.0") }}:{{ pg_read_port | default(5433) }}
+    default_backend postgres_replicas
+
+backend postgres_replicas
+    mode tcp
+    balance roundrobin
+    option httpchk GET /replica?replication_state=streaming
+    http-check expect status 200
+{% for host in groups['database'] %}
+    server {{ host | regex_replace('[^A-Za-z0-9_-]', '_') }} {{ hostvars[host].ip }}:{{ pg_port | default(5432) }} check port {{ patroni_rest_port | default(8008) }} inter 2s fall 3 rise 2 on-marked-down shutdown-sessions
+{% endfor %}
+{% endif %}
+
+# Local-only monitoring endpoint used by Docker and Ansible health checks.
+# It is not exposed to other hosts in the VPC.
+frontend haproxy_local_status
+    bind 127.0.0.1:8404
+    mode http
+    monitor-uri /healthz
+    stats enable
+    stats uri /stats
+    stats refresh 5s
+    stats hide-version

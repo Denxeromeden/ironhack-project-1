@@ -1,0 +1,74 @@
+---
+- name: Instantiate frontend
+  hosts: frontend
+  become: yes
+  vars:
+    app_dir: /opt/frontendapp
+  tasks:
+    - name: Create frontend directory
+      ansible.builtin.file:
+        path: "{{ app_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Find the Redis backend in the same AZ
+      ansible.builtin.set_fact:
+        redis_backend_matches: >-
+          {{
+            groups['backend']
+            | map('extract', hostvars)
+            | selectattr('az', 'equalto', az)
+            | list
+          }}
+
+    - name: Set the matching Redis backend
+      ansible.builtin.set_fact:
+        redis_backend: "{{ redis_backend_matches | first }}"
+
+    - name: Find the Postgres backend in the same AZ
+      ansible.builtin.set_fact:
+        postgres_backend_matches: >-
+          {{
+            groups['database']
+            | map('extract', hostvars)
+            | selectattr('az', 'equalto', az)
+            | list
+          }}
+
+    - name: Set the matching Postgres backend
+      ansible.builtin.set_fact:
+        pg_backend: "{{ postgres_backend_matches | first }}"
+
+    - name: Copy Compose configuration
+      ansible.builtin.copy:
+        src: ../compose.frontend.yml
+        dest: "{{ app_dir }}/compose.yml"
+        mode: "0644"
+
+    - name: Copy vote application source
+      ansible.builtin.copy:
+        src: ../vote/
+        dest: "{{ app_dir }}/vote/"
+        mode: preserve
+
+    - name: Copy result application source
+      ansible.builtin.copy:
+        src: ../result/
+        dest: "{{ app_dir }}/result/"
+        mode: preserve
+
+    - name: Render environment configuration
+      ansible.builtin.template:
+        src: templates/frontend.env.j2
+        dest: "{{ app_dir }}/.env"
+        mode: "0600"
+
+    - name: Start or update the application
+      community.docker.docker_compose_v2:
+        project_src: "{{ app_dir }}"
+        files:
+          - compose.yml
+        profiles:
+          - frontend
+        state: present
+        build: always

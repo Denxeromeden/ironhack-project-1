@@ -1,0 +1,28 @@
+name: database
+
+services:
+  db:
+    build:
+      context: .
+      dockerfile: Dockerfile.patroni
+    image: local/patroni-postgres:18.6-4.1.5
+    container_name: patroni
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - pg-data:/var/lib/postgresql
+      - ./patroni.yml:/etc/patroni/patroni.yml:ro
+    healthcheck:
+      test:
+        - CMD
+        - python3
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8008/liveness', timeout=3)"
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 30s
+
+volumes:
+  pg-data:
+    name: databaseapp_pg-data

@@ -1,0 +1,337 @@
+---
+# Deploy Patroni one database host at a time. This is deliberately non-destructive:
+# it never removes a data volume or reinitializes an existing PostgreSQL directory.
+- name: Deploy Patroni PostgreSQL cluster nodes
+  hosts: database
+  become: true
+  gather_facts: false
+  serial: 1
+  any_errors_fatal: true
+
+  vars:
+    app_dir: /opt/databaseapp
+    patroni_image: local/patroni-postgres:18.6-4.1.5
+    database_compose_file: compose.database.yml
+    health_retries: 60
+    health_delay: 5
+
+  pre_tasks:
+    - name: Validate inventory groups and host addresses
+      ansible.builtin.assert:
+        that:
+          - groups['database'] is defined
+          - groups['database'] | length >= 2
+          - groups['etcd'] is defined
+          - groups['etcd'] | length >= 3
+          - groups['ha_proxy'] is defined
+          - groups['ha_proxy'] | length >= 1
+          - groups['frontend'] is defined
+          - groups['frontend'] | length >= 1
+          - (groups['database'] | map('extract', hostvars, 'ip') | select('defined') | list | length) == (groups['database'] | length)
+          - (groups['etcd'] | map('extract', hostvars, 'ip') | select('defined') | list | length) == (groups['etcd'] | length)
+          - (groups['ha_proxy'] | map('extract', hostvars, 'ip') | select('defined') | list | length) == (groups['ha_proxy'] | length)
+          - (groups['frontend'] | map('extract', hostvars, 'ip') | select('defined') | list | length) == (groups['frontend'] | length)
+        fail_msg: >-
+          Inventory must define at least two database hosts, at least three etcd
+          members, at least one ha_proxy host, and an 'ip' variable for each.
+      run_once: true
+
+  tasks:
+    - name: Create database application directory
+      ansible.builtin.file:
+        path: "{{ app_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Copy database-only Compose configuration
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../compose.database.yml"
+        dest: "{{ app_dir }}/{{ database_compose_file }}"
+        owner: root
+        group: root
+        mode: "0644"
+      register: database_compose_copy
+
+    - name: Copy Patroni Dockerfile
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../Dockerfile.patroni"
+        dest: "{{ app_dir }}/Dockerfile.patroni"
+        owner: root
+        group: root
+        mode: "0644"
+      register: patroni_dockerfile_copy
+
+    - name: Create persistent Docker volume for PostgreSQL
+      community.docker.docker_volume:
+        name: databaseapp_pg-data
+        state: present
+
+    - name: Render Patroni configuration
+      ansible.builtin.template:
+        src: "{{ playbook_dir }}/templates/patroni.yml.j2"
+        dest: "{{ app_dir }}/patroni.yml"
+        owner: "999"
+        group: "999"
+        mode: "0600"
+      register: patroni_config_copy
+      no_log: true
+
+    - name: Validate database Compose configuration
+      ansible.builtin.command:
+        argv:
+          - docker
+          - compose
+          - -f
+          - "{{ database_compose_file }}"
+          - config
+          - --quiet
+      args:
+        chdir: "{{ app_dir }}"
+      changed_when: false
+
+    - name: Check whether the pinned Patroni image exists locally
+      ansible.builtin.command:
+        argv:
+          - docker
+          - image
+          - inspect
+          - "{{ patroni_image }}"
+      register: patroni_image_inspect
+      changed_when: false
+      failed_when: false
+
+    - name: Build Patroni image only when required
+      ansible.builtin.command:
+        argv:
+          - docker
+          - compose
+          - -f
+          - "{{ database_compose_file }}"
+          - build
+          - db
+      args:
+        chdir: "{{ app_dir }}"
+      register: patroni_image_build
+      changed_when: true
+      when: >-
+        patroni_image_inspect.rc != 0 or
+        patroni_dockerfile_copy.changed or
+        database_compose_copy.changed
+
+    - name: Start or reconcile this Patroni node
+      community.docker.docker_compose_v2:
+        project_src: "{{ app_dir }}"
+        files:
+          - "{{ database_compose_file }}"
+        services:
+          - db
+        state: present
+        build: never
+        # Active pg_hba is reconciled via Patroni's DCS API below; do not
+        # restart database containers simply because this mounted template changed.
+        recreate: auto
+        wait: false
+        timeout: 60
+
+    - name: Wait for Patroni and PostgreSQL readiness, with startup diagnostics on failure
+      block:
+        - name: Wait until PostgreSQL is running under Patroni
+          ansible.builtin.uri:
+            url: http://127.0.0.1:8008/health
+            method: GET
+            status_code: 200
+            return_content: false
+            timeout: 5
+          register: patroni_health
+          retries: "{{ health_retries }}"
+          delay: "{{ health_delay }}"
+          until: patroni_health.status | default(0) == 200
+        - name: Wait until this node is the leader or a sufficiently caught-up replica
+          ansible.builtin.uri:
+            url: http://127.0.0.1:8008/readiness
+            method: GET
+            status_code: 200
+            return_content: false
+            timeout: 5
+          register: patroni_readiness
+          retries: "{{ health_retries }}"
+          delay: "{{ health_delay }}"
+          until: patroni_readiness.status | default(0) == 200
+
+      rescue:
+        - name: Collect Compose status after Patroni readiness failure
+          ansible.builtin.command:
+            argv:
+              - docker
+              - compose
+              - -f
+              - "{{ database_compose_file }}"
+              - ps
+              - --all
+          args:
+            chdir: "{{ app_dir }}"
+          register: patroni_compose_ps
+          changed_when: false
+          failed_when: false
+
+        - name: Collect Patroni logs after readiness failure
+          ansible.builtin.command:
+            argv:
+              - docker
+              - logs
+              - --tail
+              - "200"
+              - patroni
+          register: patroni_logs_on_failure
+          changed_when: false
+          failed_when: false
+
+        - name: Display startup diagnostics
+          ansible.builtin.debug:
+            msg:
+              - "Compose status on {{ inventory_hostname }}:"
+              - "{{ patroni_compose_ps.stdout | default(patroni_compose_ps.stderr | default('No Compose output')) }}"
+              - "Patroni logs on {{ inventory_hostname }}:"
+              - "{{ patroni_logs_on_failure.stdout | default('') }}"
+              - "{{ patroni_logs_on_failure.stderr | default('') }}"
+
+        - name: Fail after displaying Patroni startup diagnostics
+          ansible.builtin.fail:
+            msg: >-
+              Patroni did not become ready on {{ inventory_hostname }}. The container
+              logs and Compose state are shown above. No PostgreSQL volume was deleted
+              and no automatic reinitialization was attempted.
+
+# Run validation only after the staged deployment has completed on every host.
+- name: Validate the complete Patroni cluster
+  hosts: database
+  become: true
+  gather_facts: false
+  any_errors_fatal: true
+
+  vars:
+    cluster_retries: 60
+    cluster_delay: 5
+
+  tasks:
+    # bootstrap.dcs is only consumed when the DCS cluster is first initialized.
+    # Reconcile this specific dynamic setting for an existing cluster as well.
+    - name: Initialize desired PostgreSQL client access rules
+      ansible.builtin.set_fact:
+        patroni_desired_pg_hba:
+          - "local all {{ pg_user }} peer"
+          - "host all all 127.0.0.1/32 scram-sha-256"
+      run_once: true
+
+    - name: Add replication and pg_rewind access for every database host
+      ansible.builtin.set_fact:
+        patroni_desired_pg_hba: "{{ patroni_desired_pg_hba + [
+          'host replication replication ' ~ hostvars[item].ip ~ '/32 scram-sha-256',
+          'host all ' ~ pg_user ~ ' ' ~ hostvars[item].ip ~ '/32 scram-sha-256'
+          ] }}"
+      loop: "{{ groups['database'] }}"
+      run_once: true
+
+    - name: Add PostgreSQL client access from every HAProxy host
+      ansible.builtin.set_fact:
+        patroni_desired_pg_hba: "{{ patroni_desired_pg_hba + [
+          'host ' ~ pg_db ~ ' ' ~ pg_user ~ ' ' ~ hostvars[item].ip ~ '/32 scram-sha-256'
+          ] }}"
+      loop: "{{ groups['ha_proxy'] }}"
+      run_once: true
+
+    - name: Add PostgreSQL client access from every frontend host
+      ansible.builtin.set_fact:
+        patroni_desired_pg_hba: "{{ patroni_desired_pg_hba + [
+          'host ' ~ pg_db ~ ' ' ~ pg_user ~ ' ' ~ hostvars[item].ip ~ '/32 scram-sha-256'
+          ] }}"
+      loop: "{{ groups['frontend'] }}"
+      run_once: true
+
+    - name: Read current Patroni dynamic configuration
+      ansible.builtin.uri:
+        url: http://127.0.0.1:8008/config
+        method: GET
+        status_code: 200
+        return_content: true
+        timeout: 5
+      delegate_to: "{{ groups['database'][0] }}"
+      run_once: true
+      register: patroni_current_config
+      retries: 12
+      delay: 5
+      until: patroni_current_config.status | default(0) == 200
+
+    - name: Reconcile PostgreSQL pg_hba rules in Patroni's dynamic configuration
+      ansible.builtin.uri:
+        url: http://127.0.0.1:8008/config
+        method: PATCH
+        headers:
+          Content-Type: application/json
+        body_format: raw
+        body: "{{ {'postgresql': {'pg_hba': patroni_desired_pg_hba}} | to_json }}"
+        status_code: 200
+        return_content: true
+        timeout: 10
+      delegate_to: "{{ groups['database'][0] }}"
+      run_once: true
+      register: patroni_config_patch_result
+      when: >-
+        (patroni_current_config.json.postgresql.pg_hba | default([])) != patroni_desired_pg_hba
+
+    - name: Verify Patroni accepted the desired pg_hba rules
+      ansible.builtin.uri:
+        url: http://127.0.0.1:8008/config
+        method: GET
+        status_code: 200
+        return_content: true
+        timeout: 5
+      delegate_to: "{{ groups['database'][0] }}"
+      run_once: true
+      register: patroni_current_config_after_patch
+      retries: 12
+      delay: 5
+      until:
+        - patroni_current_config_after_patch.status | default(0) == 200
+        - (patroni_current_config_after_patch.json.postgresql.pg_hba | default([])) == patroni_desired_pg_hba
+
+    - name: Wait until Patroni reports one leader and all replicas streaming
+      ansible.builtin.uri:
+        url: http://127.0.0.1:8008/cluster
+        method: GET
+        status_code: 200
+        return_content: true
+        timeout: 5
+      delegate_to: "{{ groups['database'][0] }}"
+      run_once: true
+      register: patroni_cluster_status
+      retries: "{{ cluster_retries }}"
+      delay: "{{ cluster_delay }}"
+      until: >-
+        (patroni_cluster_status.json.members | default([]) | length == groups['database'] | length) and
+        (patroni_cluster_status.json.members | selectattr('role', 'equalto', 'leader') | list | length == 1) and
+        (patroni_cluster_status.json.members | selectattr('role', 'equalto', 'replica') | selectattr('state', 'equalto', 'streaming') | list | length == (groups['database'] | length - 1)) and
+        ((groups['database'] | difference(patroni_cluster_status.json.members | map(attribute='name') | list) | length) == 0)
+
+    - name: Assert exactly one leader and streaming replicas
+      ansible.builtin.assert:
+        that:
+          - patroni_cluster_status.json.members | length == groups['database'] | length
+          - (patroni_cluster_status.json.members | selectattr('role', 'equalto', 'leader') | list | length) == 1
+          - (patroni_cluster_status.json.members | selectattr('role', 'equalto', 'replica') | selectattr('state', 'equalto', 'streaming') | list | length) == (groups['database'] | length - 1)
+          - (groups['database'] | difference(patroni_cluster_status.json.members | map(attribute='name') | list) | length) == 0
+        fail_msg: >-
+          Patroni cluster membership is not healthy. Expected exactly one leader,
+          all other database nodes as streaming replicas, and all inventory members
+          present. Current response: {{ patroni_cluster_status.json | default(patroni_cluster_status.msg | default('no response')) }}
+        success_msg: >-
+          Patroni cluster is healthy: exactly one leader and all remaining database
+          nodes are streaming replicas.
+      run_once: true
+
+    - name: Display verified Patroni cluster membership
+      ansible.builtin.debug:
+        var: patroni_cluster_status.json.members
+      run_once: true

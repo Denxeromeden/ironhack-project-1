@@ -1,0 +1,244 @@
+---
+- name: Deploy HAProxy PostgreSQL write endpoint
+  hosts: ha_proxy
+  become: true
+  gather_facts: false
+  serial: 1
+  any_errors_fatal: true
+
+  vars:
+    haproxy_dir: /opt/haproxyapp
+    haproxy_compose_file: compose.haproxy.yml
+    haproxy_image: haproxy:3.4.4-alpine@sha256:c0afc4864dca9c68694cd1290433f0ee79b5c55be80f6745a165ffe373b9a564
+    haproxy_health_retries: 30
+    haproxy_health_delay: 2
+    haproxy_listen_address: "0.0.0.0"
+    patroni_rest_port: 8008
+    pg_read_port: 5433
+    haproxy_enable_read_endpoint: false
+
+  pre_tasks:
+    - name: Validate inventory groups and private addresses
+      ansible.builtin.assert:
+        that:
+          - groups['ha_proxy'] is defined
+          - groups['ha_proxy'] | length >= 1
+          - groups['database'] is defined
+          - groups['database'] | length >= 2
+          - (groups['ha_proxy'] | map('extract', hostvars, 'ip') | select('defined') | list | length) == (groups['ha_proxy'] | length)
+          - (groups['database'] | map('extract', hostvars, 'ip') | select('defined') | list | length) == (groups['database'] | length)
+        fail_msg: >-
+          Inventory must define at least one ha_proxy host and at least two database
+          hosts, each with an 'ip' variable.
+      run_once: true
+
+  tasks:
+    - name: Create HAProxy application directory
+      ansible.builtin.file:
+        path: "{{ haproxy_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Copy HAProxy Compose configuration
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../compose.haproxy.yml"
+        dest: "{{ haproxy_dir }}/{{ haproxy_compose_file }}"
+        owner: root
+        group: root
+        mode: "0644"
+      register: haproxy_compose_copy
+
+    - name: Render HAProxy configuration
+      ansible.builtin.template:
+        src: "{{ playbook_dir }}/templates/haproxy.cfg.j2"
+        dest: "{{ haproxy_dir }}/haproxy.cfg"
+        owner: root
+        group: root
+        mode: "0644"
+      register: haproxy_config_template
+
+    - name: Validate Compose configuration
+      ansible.builtin.command:
+        argv:
+          - docker
+          - compose
+          - -f
+          - "{{ haproxy_compose_file }}"
+          - config
+          - --quiet
+      args:
+        chdir: "{{ haproxy_dir }}"
+      changed_when: false
+
+    - name: Check whether the pinned HAProxy image is available locally
+      ansible.builtin.command:
+        argv:
+          - docker
+          - image
+          - inspect
+          - "{{ haproxy_image }}"
+      register: haproxy_image_inspect
+      changed_when: false
+      failed_when: false
+
+    - name: Pull the pinned HAProxy image if not already present
+      ansible.builtin.command:
+        argv:
+          - docker
+          - pull
+          - "{{ haproxy_image }}"
+      register: haproxy_image_pull
+      changed_when: true
+      when: haproxy_image_inspect.rc != 0
+
+    - name: Validate HAProxy configuration before applying it
+      ansible.builtin.command:
+        argv:
+          - docker
+          - run
+          - --rm
+          - --network
+          - host
+          - --volume
+          - "{{ haproxy_dir }}/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro"
+          - "{{ haproxy_image }}"
+          - haproxy
+          - -c
+          - -f
+          - /usr/local/etc/haproxy/haproxy.cfg
+      changed_when: false
+
+    - name: Start or reconcile HAProxy
+      community.docker.docker_compose_v2:
+        project_src: "{{ haproxy_dir }}"
+        files:
+          - "{{ haproxy_compose_file }}"
+        services:
+          - haproxy
+        state: present
+        pull: never
+        recreate: "{{ 'always' if (haproxy_config_template.changed or haproxy_compose_copy.changed) else 'auto' }}"
+        wait: false
+        timeout: 60
+
+    - name: Wait for HAProxy local health endpoint
+      block:
+        - name: Check HAProxy process health
+          ansible.builtin.uri:
+            url: http://127.0.0.1:8404/healthz
+            method: GET
+            status_code: 200
+            return_content: false
+            timeout: 3
+          register: haproxy_health
+          retries: "{{ haproxy_health_retries }}"
+          delay: "{{ haproxy_health_delay }}"
+          until: haproxy_health.status | default(0) == 200
+
+        - name: Wait for exactly one Patroni primary to be healthy behind HAProxy
+          ansible.builtin.command:
+            argv:
+              - python3
+              - -c
+              - |
+                import csv
+                import sys
+                import urllib.request
+
+                expected = int(sys.argv[1])
+                check_reads = sys.argv[2].lower() == 'true'
+                url = 'http://127.0.0.1:8404/stats;csv'
+                with urllib.request.urlopen(url, timeout=5) as response:
+                    rows = list(csv.reader(response.read().decode('utf-8').splitlines()))
+                if not rows:
+                    raise SystemExit('HAProxy stats endpoint returned no data')
+                headers = [value.strip().lstrip('#').strip() for value in rows[0]]
+                records = [dict(zip(headers, row)) for row in rows[1:] if row]
+                servers = [row for row in records
+                           if row.get('pxname') == 'postgres_primary'
+                           and row.get('svname') not in ('FRONTEND', 'BACKEND')]
+                healthy = [row for row in servers
+                           if row.get('status', '').startswith('UP')]
+                print('Primary backend servers: ' + ', '.join(
+                    row.get('svname', '?') + '=' + row.get('status', '?')
+                    for row in servers))
+                if len(servers) != expected or len(healthy) != 1:
+                    raise SystemExit(
+                        f'Expected {expected} DB servers and exactly one healthy primary; '
+                        f'found {len(servers)} servers and {len(healthy)} healthy')
+                if check_reads:
+                    read_servers = [row for row in records
+                                    if row.get('pxname') == 'postgres_replicas'
+                                    and row.get('svname') not in ('FRONTEND', 'BACKEND')]
+                    read_healthy = [row for row in read_servers
+                                    if row.get('status', '').startswith('UP')]
+                    print('Replica backend servers: ' + ', '.join(
+                        row.get('svname', '?') + '=' + row.get('status', '?')
+                        for row in read_servers))
+                    if len(read_servers) != expected or len(read_healthy) != expected - 1:
+                        raise SystemExit(
+                            f'Expected {expected} DB servers and {expected - 1} healthy replicas; '
+                            f'found {len(read_servers)} servers and {len(read_healthy)} healthy')
+              - "{{ groups['database'] | length }}"
+              - "{{ 'true' if haproxy_enable_read_endpoint else 'false' }}"
+          register: haproxy_backend_health
+          changed_when: false
+          retries: "{{ haproxy_health_retries }}"
+          delay: "{{ haproxy_health_delay }}"
+          until: haproxy_backend_health.rc | default(1) == 0
+
+      rescue:
+        - name: Collect HAProxy Compose status
+          ansible.builtin.command:
+            argv:
+              - docker
+              - compose
+              - -f
+              - "{{ haproxy_compose_file }}"
+              - ps
+              - --all
+          args:
+            chdir: "{{ haproxy_dir }}"
+          register: haproxy_compose_ps
+          changed_when: false
+          failed_when: false
+
+        - name: Collect HAProxy logs
+          ansible.builtin.command:
+            argv:
+              - docker
+              - logs
+              - --tail
+              - "200"
+              - haproxy
+          register: haproxy_logs_on_failure
+          changed_when: false
+          failed_when: false
+
+        - name: Display HAProxy diagnostics
+          ansible.builtin.debug:
+            msg:
+              - "Compose status on {{ inventory_hostname }}:"
+              - "{{ haproxy_compose_ps.stdout | default(haproxy_compose_ps.stderr | default('No Compose output')) }}"
+              - "Primary backend health check output: {{ haproxy_backend_health.stdout | default('not reached') }}"
+              - "Primary backend health check error: {{ haproxy_backend_health.stderr | default('') }}"
+              - "HAProxy logs on {{ inventory_hostname }}:"
+              - "{{ haproxy_logs_on_failure.stdout | default('') }}"
+              - "{{ haproxy_logs_on_failure.stderr | default('') }}"
+
+        - name: Fail after displaying HAProxy diagnostics
+          ansible.builtin.fail:
+            msg: >-
+              HAProxy did not become healthy or did not detect exactly one Patroni
+              primary on {{ inventory_hostname }}. Verify security-group access to
+              PostgreSQL port {{ pg_port | default(5432) }} and Patroni REST port 8008.
+
+    - name: Display PostgreSQL write endpoint
+      ansible.builtin.debug:
+        msg: >-
+          HAProxy is healthy on {{ inventory_hostname }}. Clients on this host's
+          allowed network should connect to {{ hostvars[inventory_hostname].ip }}:{{ pg_port | default(5432) }}.
+          The endpoint forwards new connections to the Patroni node returning HTTP 200 on /primary.
+          {% if haproxy_enable_read_endpoint %}Replica-only read endpoint: {{ hostvars[inventory_hostname].ip }}:{{ pg_read_port }}.{% else %}Replica-only read endpoint is disabled (set haproxy_enable_read_endpoint: true after confirming read-lag tolerance).{% endif %}

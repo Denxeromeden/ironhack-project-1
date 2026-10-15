@@ -21,24 +21,22 @@ namespace Worker
                 var dbUsername = Environment.GetEnvironmentVariable("DB_USERNAME") ?? "postgres";
                 var dbPassword = Environment.GetEnvironmentVariable("DB_PASSWORD") ?? "postgres";
                 var dbName = Environment.GetEnvironmentVariable("DB_NAME") ?? "postgres";
-                
+
                 var redisHost = Environment.GetEnvironmentVariable("REDIS_HOST") ?? "redis";
 
                 // Construct the connection strings
-                var pgConnectionString = $"Server={dbHost};Username={dbUsername};Password={dbPassword};Database={dbName}";
+                var pgConnectionString =
+                    $"Server={dbHost};Username={dbUsername};Password={dbPassword};Database={dbName}";
                 Console.WriteLine($"Database connection string: {pgConnectionString}");
+
                 var redisConnectionString = redisHost;
 
                 var pgsql = OpenDbConnection(pgConnectionString);
                 var redisConn = OpenRedisConnection(redisConnectionString);
                 var redis = redisConn.GetDatabase();
 
-                // Keep alive is not implemented in Npgsql yet. This workaround was recommended:
-                // https://github.com/npgsql/npgsql/issues/1214#issuecomment-235828359
-                var keepAliveCommand = pgsql.CreateCommand();
-                keepAliveCommand.CommandText = "SELECT 1";
-
                 var definition = new { vote = "", voter_id = "" };
+
                 while (true)
                 {
                     // Slow down to prevent CPU spike, only query each 100ms
@@ -53,25 +51,35 @@ namespace Worker
                     }
 
                     string json = redis.ListLeftPopAsync("votes").Result;
+
                     if (json != null)
                     {
                         var vote = JsonConvert.DeserializeAnonymousType(json, definition);
-                        Console.WriteLine($"Processing vote for '{vote.vote}' by '{vote.voter_id}'");
+                        Console.WriteLine(
+                            $"Processing vote for '{vote.vote}' by '{vote.voter_id}'");
 
-                        // Reconnect DB if down
-                        if (!pgsql.State.Equals(System.Data.ConnectionState.Open))
-                        {
-                            Console.WriteLine("Reconnecting DB");
-                            pgsql = OpenDbConnection(pgConnectionString);
-                        }
-                        else
-                        { // Normal +1 vote requested
-                            UpdateVote(pgsql, vote.voter_id, vote.vote);
-                        }
+                        // Retry the vote operation if PostgreSQL fails.
+                        ExecuteWithDbRetry(
+                            ref pgsql,
+                            pgConnectionString,
+                            connection => UpdateVote(
+                                connection, vote.voter_id, vote.vote));
                     }
                     else
                     {
-                        keepAliveCommand.ExecuteNonQuery();
+                        // Keep the connection alive and reconnect if failover
+                        // has made the existing connection unusable.
+                        ExecuteWithDbRetry(
+                            ref pgsql,
+                            pgConnectionString,
+                            connection =>
+                            {
+                                using (var command = connection.CreateCommand())
+                                {
+                                    command.CommandText = "SELECT 1";
+                                    command.ExecuteNonQuery();
+                                }
+                            });
                     }
                 }
             }
@@ -79,6 +87,65 @@ namespace Worker
             {
                 Console.Error.WriteLine(ex.ToString());
                 return 1;
+            }
+        }
+
+        private static void ExecuteWithDbRetry(
+            ref NpgsqlConnection connection,
+            string connectionString,
+            Action<NpgsqlConnection> operation)
+        {
+            while (true)
+            {
+                try
+                {
+                    if (connection == null ||
+                        connection.State != System.Data.ConnectionState.Open)
+                    {
+                        throw new NpgsqlException("Database connection is not open");
+                    }
+
+                    operation(connection);
+                    return;
+                }
+                catch (DbException ex)
+                {
+                    Console.Error.WriteLine(
+                        $"Database operation failed: {ex.Message}. Reconnecting to db.");
+
+                    try
+                    {
+                        connection?.Dispose();
+                    }
+                    catch
+                    {
+                        // Continue reconnecting.
+                    }
+
+                    connection = null;
+
+                    Thread.Sleep(1000);
+                    connection = OpenDbConnection(connectionString);
+                }
+                catch (SocketException ex)
+                {
+                    Console.Error.WriteLine(
+                        $"Database connection failed: {ex.Message}. Reconnecting to db.");
+
+                    try
+                    {
+                        connection?.Dispose();
+                    }
+                    catch
+                    {
+                        // Continue reconnecting.
+                    }
+
+                    connection = null;
+
+                    Thread.Sleep(1000);
+                    connection = OpenDbConnection(connectionString);
+                }
             }
         }
 
@@ -108,12 +175,13 @@ namespace Worker
 
             Console.Error.WriteLine("Connected to db");
 
-            var command = connection.CreateCommand();
-            command.CommandText = @"CREATE TABLE IF NOT EXISTS votes (
-                                        id VARCHAR(255) NOT NULL,
-                                        vote VARCHAR(255) NOT NULL
-                                    )";
-            command.ExecuteNonQuery();
+            using (var command = connection.CreateCommand())
+            {
+                command.CommandText = @"CREATE TABLE IF NOT EXISTS votes (
+                    id VARCHAR(255) NOT NULL UNIQUE,
+                    vote VARCHAR(255) NOT NULL)";
+                command.ExecuteNonQuery();
+            }
 
             return connection;
         }
@@ -146,25 +214,24 @@ namespace Worker
                 .First(a => a.AddressFamily == AddressFamily.InterNetwork)
                 .ToString();
 
-        private static void UpdateVote(NpgsqlConnection connection, string voterId, string vote)
-        {
-            var command = connection.CreateCommand();
-            try
+        private static void UpdateVote(
+                NpgsqlConnection connection,
+                string voterId,
+                string vote)
             {
-                command.CommandText = "INSERT INTO votes (id, vote) VALUES (@id, @vote)";
-                command.Parameters.AddWithValue("@id", voterId);
-                command.Parameters.AddWithValue("@vote", vote);
-                command.ExecuteNonQuery();
+                using (var command = connection.CreateCommand())
+                {
+                    command.CommandText = @"
+                        INSERT INTO votes (id, vote)
+                        VALUES (@id, @vote)
+                        ON CONFLICT (id)
+                        DO UPDATE SET vote = EXCLUDED.vote";
+
+                    command.Parameters.AddWithValue("@id", voterId);
+                    command.Parameters.AddWithValue("@vote", vote);
+
+                    command.ExecuteNonQuery();
+                }
             }
-            catch (DbException)
-            {
-                command.CommandText = "UPDATE votes SET vote = @vote WHERE id = @id";
-                command.ExecuteNonQuery();
-            }
-            finally
-            {
-                command.Dispose();
-            }
-        }
     }
 }

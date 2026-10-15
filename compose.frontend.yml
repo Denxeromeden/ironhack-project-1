@@ -1,0 +1,30 @@
+name: frontend
+
+services:
+  vote:
+    build: ./vote 
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "80:80"
+    networks:
+      - front-tier-vote
+    profiles:
+      - frontend
+
+  result:
+    build: ./result
+    env_file:
+      - .env
+    restart: unless-stopped
+    ports:
+      - "8080:80"
+    networks:
+      - front-tier-result
+    profiles:
+      - frontend
+
+networks:
+  front-tier-vote:
+  front-tier-result:

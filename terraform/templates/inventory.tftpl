@@ -1,0 +1,33 @@
+[all:vars]
+ansible_user=ec2-user
+
+# --- Functional Groups ---
+[frontend]
+%{ for key, inst in instances ~}
+%{ if startswith(inst.tags.Name, sub[0]) ~}
+${key} ip=${inst.private_ip} az=${inst.availability_zone} ansible_host=${inst.id}
+%{ endif ~}
+%{ endfor ~}
+
+[backend]
+%{ for key, inst in instances ~}
+%{ if startswith(inst.tags.Name, sub[1]) ~}
+${key} ip=${inst.private_ip} az=${inst.availability_zone} ansible_host=${inst.id}
+%{ endif ~}
+%{ endfor ~}
+
+[database]
+%{ for key, inst in instances ~}
+%{ if startswith(inst.tags.Name, sub[2]) ~}
+${key} ip=${inst.private_ip} az=${inst.availability_zone} ansible_host=${inst.id}
+%{ endif ~}
+%{ endfor ~}
+
+[ha_proxy]
+ha-proxy ip=${ha_proxy.private_ip} az=${ha_proxy.availability_zone} ansible_host=${ha_proxy.id}
+
+[etcd]
+%{ for key in etcd_database_members ~}
+${key}
+%{ endfor ~}
+ha-proxy

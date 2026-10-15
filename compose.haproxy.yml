@@ -1,0 +1,18 @@
+name: haproxyapp
+
+services:
+  haproxy:
+    image: haproxy:3.4.4-alpine@sha256:c0afc4864dca9c68694cd1290433f0ee79b5c55be80f6745a165ffe373b9a564
+    container_name: haproxy
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - wget -q -O /dev/null http://127.0.0.1:8404/healthz
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 10s

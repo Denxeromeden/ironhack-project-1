@@ -1,0 +1,81 @@
+---
+- name: Deploy three-member etcd cluster
+  hosts: etcd
+  become: true
+  vars:
+    app_dir: /opt/etcd
+    etcd_initial_cluster_state: new #for initial bootstrap. existing for following
+
+  tasks:
+    - name: Create etcd application directory
+      ansible.builtin.file:
+        path: "{{ app_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Copy Compose configuration
+      ansible.builtin.copy:
+        src: ../compose.etcd.yml
+        dest: "{{ app_dir }}/compose.yml"
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Render etcd environment
+      ansible.builtin.template:
+        src: templates/etcd.env.j2
+        dest: "{{ app_dir }}/.env"
+        owner: root
+        group: root
+        mode: "0600"
+
+    - name: Start etcd
+      community.docker.docker_compose_v2:
+        project_src: "{{ app_dir }}"
+        files:
+          - compose.yml
+        profiles:
+          - etcd
+        state: present
+        recreate: auto
+
+    - name: Wait for all etcd endpoints to become healthy
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - etcd
+          - etcdctl
+          - --endpoints={% for host in groups['etcd'] %}http://{{ hostvars[host].ip }}:2379{% if not loop.last %},{% endif %}{% endfor %}
+          - endpoint
+          - health
+      delegate_to: "{{ groups['database'][0] }}"
+      run_once: true
+      register: etcd_health
+      changed_when: false
+      retries: 12
+      delay: 5
+      until: etcd_health.rc == 0
+
+    - name: Display etcd membership and status
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - etcd
+          - etcdctl
+          - --endpoints={% for host in groups['etcd'] %}http://{{ hostvars[host].ip }}:2379{% if not loop.last %},{% endif %}{% endfor %}
+          - endpoint
+          - status
+          - --write-out=table
+      delegate_to: "{{ groups['database'][0] }}"
+      run_once: true
+      register: etcd_status
+      changed_when: false
+
+    - name: Show etcd status
+      ansible.builtin.debug:
+        var: etcd_status.stdout_lines
+      run_once: true

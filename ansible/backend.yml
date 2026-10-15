@@ -1,0 +1,53 @@
+---
+- name: Instantiate backend
+  hosts: backend
+  become: yes
+  vars:
+    app_dir: /opt/backendapp
+  tasks:
+    - name: Create backend directory
+      ansible.builtin.file:
+        path: "{{ app_dir }}"
+        state: directory
+        mode: "0755"
+        
+    - name: Copy Compose configuration
+      ansible.builtin.copy:
+        src: ../compose.backend.yml
+        dest: "{{ app_dir }}/compose.yml"
+        mode: "0644"
+
+    - name: Copy worker application source
+      ansible.builtin.copy:
+        src: ../worker/
+        dest: "{{ app_dir }}/worker/"
+        mode: preserve
+
+    - name: Create healthchecks directory
+      ansible.builtin.file:
+        path: "{{ app_dir }}/healthchecks"
+        state: directory
+        mode: "0755"
+
+    - name: Copy healthcheck
+      ansible.builtin.copy:
+        src: ../healthchecks/redis.sh
+        dest: "{{ app_dir }}/healthchecks/redis.sh"
+        mode: "0755"
+
+    - name: Render environment configuration
+      ansible.builtin.template:
+        src: templates/backend.env.j2
+        dest: "{{ app_dir }}/.env"
+        mode: "0600"
+        no_log: true
+
+    - name: Start or update the application
+      community.docker.docker_compose_v2:
+        project_src: "{{ app_dir }}"
+        files:
+          - compose.yml
+        profiles:
+          - backend
+        state: present
+        build: always

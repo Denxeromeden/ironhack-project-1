@@ -1,0 +1,48 @@
+---
+- name: Install Docker engine
+  hosts: ha_proxy:frontend:backend:database
+  become: yes
+  tasks:
+    - name: Install Docker engine
+      dnf:
+        name: "docker"
+        state: present
+        update_cache: yes
+
+    - name: Start and enable docker service
+      service:
+        name: docker
+        state: started
+        enabled: yes
+
+    - name: Add ec2-user to docker group
+      user:
+        name: ec2-user
+        groups: docker
+        append: yes
+
+    - name: Create docker CLI plugins directory
+      file:
+        path: /usr/libexec/docker/cli-plugins
+        state: directory
+        mode: '0755'
+
+    - name: Install docker compose plugin binary
+      get_url:
+        url: https://github.com/docker/compose/releases/download/v5.6.0/docker-compose-linux-aarch64
+        dest: /usr/libexec/docker/cli-plugins/docker-compose
+        mode: '0755'
+
+    - name: Install docker buildx plugin binary
+      ansible.builtin.get_url:
+        url: https://github.com/docker/buildx/releases/download/v0.38.0/buildx-v0.38.0.linux-arm64
+        dest: /usr/libexec/docker/cli-plugins/docker-buildx
+        mode: "0755"
+        owner: root
+        group: root
+
+    - name: Add ssm-user to docker group
+      user:
+        name: ssm-user
+        groups: docker
+        append: yes

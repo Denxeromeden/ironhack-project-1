@@ -1,0 +1,11 @@
+.terraform*
+.terraform/*
+.terraform/
+*.tfstate
+*.tfstate*
+*.tfvars
+*.tfvars*
+backend.conf
+group_vars/
+group_vars/*
+inventory.ini
