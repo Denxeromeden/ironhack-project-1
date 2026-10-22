@@ -39,45 +39,43 @@ var pgUser = process.env.PG_USER || 'postgres';
 var pgPassword = process.env.PG_PASSWORD || 'postgres';
 var pgDatabase = process.env.PG_DATABASE || 'postgres';
 
-var pool = new Pool({
-  host: pgHost,
-  port: pgPort,
-  user: pgUser,
-  password: pgPassword,
-  database: pgDatabase,
+var connectionString = `postgresql://${pgUser}:${pgPassword}@${pgHost}:${pgPort}/${pgDatabase}`;
+console.log(`Connecting to db: host=${pgHost} port=${pgPort} user=${pgUser} database=${pgDatabase}`);
 
   // Return control to the retry loop if the DB cannot be reached.
   connectionTimeoutMillis: 5000
 });
 
-// Handle unexpected errors on idle pooled connections.
+// An idle client whose connection drops emits 'error' on the pool; with no
+// listener, Node treats it as uncaught and ends the process.
 pool.on('error', function (err) {
-  console.error('Unexpected PostgreSQL connection error:', err.message);
+  console.error("Idle db connection failed: " + err.message);
 });
 
-async function getVotes() {
-  try {
-    // Acquire and release a connection for each query.
-    // The pool can replace connections that fail after a database failover.
-    var result = await pool.query(
-      'SELECT vote, COUNT(id) AS count FROM votes GROUP BY vote'
-    );
+var connected = false;
 
-    var votes = collectVotesFromResult(result);
+function getVotes() {
+  pool.query('SELECT vote, COUNT(id) AS count FROM votes GROUP BY vote', [], function (err, result) {
+    if (err) {
+      console.error("Error performing query: " + err);
+    } else {
+      if (!connected) {
+        console.log("Connected to db");
+        connected = true;
+      }
+      var votes = collectVotesFromResult(result);
 
-    // Broadcast to both namespaces.
-    rootNamespace.emit('scores', JSON.stringify(votes));
-    resultNamespace.emit('scores', JSON.stringify(votes));
-  } catch (err) {
-    console.error(
-      'Database query failed; will retry:',
-      err.message
-    );
-  } finally {
-    // Always try again, whether the query succeeded or failed.
+      // Broadcast to both namespaces
+      rootNamespace.emit("scores", JSON.stringify(votes));
+      resultNamespace.emit("scores", JSON.stringify(votes));
+    }
+
+    // Repeat periodically, after a success or a failure alike
     setTimeout(getVotes, 1000);
-  }
+  });
 }
+
+getVotes();
 
 function collectVotesFromResult(result) {
   var votes = { a: 0, b: 0 };

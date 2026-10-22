@@ -18,10 +18,12 @@ ENV PORT=80 \
     PG_HOST=db \
     PG_PORT=5432 \
     PG_USER=postgres \
-    PG_PASSWORD=postgres \
     PG_DATABASE=postgres
 
 EXPOSE 80
+
+# node, the unprivileged user the Node image ships
+USER 1000
 
 ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["node", "server.js"]

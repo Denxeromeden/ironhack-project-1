@@ -1,4 +1,5 @@
 using System;
+using System.Data;
 using System.Data.Common;
 using System.Linq;
 using System.Net;
@@ -12,6 +13,8 @@ namespace Worker
 {
     public class Program
     {
+        private const int MaxStrikes = 3;
+
         public static int Main(string[] args)
         {
             try
@@ -23,17 +26,30 @@ namespace Worker
                 var dbName = Environment.GetEnvironmentVariable("DB_NAME") ?? "postgres";
 
                 var redisHost = Environment.GetEnvironmentVariable("REDIS_HOST") ?? "redis";
+                var votingMode = Environment.GetEnvironmentVariable("VOTING_MODE");
+                if (string.IsNullOrEmpty(votingMode))
+                {
+                    votingMode = "every-click";
+                }
+                if (votingMode != "every-click" && votingMode != "one-per-voter")
+                {
+                    Console.Error.WriteLine($"VOTING_MODE must be 'every-click' or 'one-per-voter', got '{votingMode}'");
+                    return 1;
+                }
 
                 // Construct the connection strings
-                var pgConnectionString =
-                    $"Server={dbHost};Username={dbUsername};Password={dbPassword};Database={dbName}";
-                Console.WriteLine($"Database connection string: {pgConnectionString}");
-
+                var pgConnectionString = $"Server={dbHost};Username={dbUsername};Password={dbPassword};Database={dbName}";
+                Console.WriteLine($"Connecting to db: host={dbHost} user={dbUsername} database={dbName}");
                 var redisConnectionString = redisHost;
 
-                var pgsql = OpenDbConnection(pgConnectionString);
-                var redisConn = OpenRedisConnection(redisConnectionString);
-                var redis = redisConn.GetDatabase();
+                NpgsqlConnection? pgsql = null;
+                ConnectionMultiplexer? redisConn = null;
+                IDatabase? redis = null;
+                var dbStale = true;
+                var redisStale = true;
+                string? pendingPushBack = null;
+                string? lastFailedVote = null;
+                var strikes = 0;
 
                 var definition = new { vote = "", voter_id = "" };
 
@@ -42,44 +58,115 @@ namespace Worker
                     // Slow down to prevent CPU spike, only query each 100ms
                     Thread.Sleep(100);
 
-                    // Reconnect redis if down
-                    if (redisConn == null || !redisConn.IsConnected)
+                    // Open or reopen what the last failure marked stale, put a vote that
+                    // could not be stored back in the queue, then take the next vote.
+                    // A failure here is a failure of the service the stage talks to.
+                    var stage = "redis";
+                    string? json;
+                    try
                     {
-                        Console.WriteLine("Reconnecting Redis");
-                        redisConn = OpenRedisConnection(redisConnectionString);
-                        redis = redisConn.GetDatabase();
+                        if (redisStale)
+                        {
+                            DisposeQuietly(redisConn);
+                            redisConn = OpenRedisConnection(redisConnectionString);
+                            redis = redisConn.GetDatabase();
+                            redisStale = false;
+                        }
+                        if (pendingPushBack != null)
+                        {
+                            redis!.ListLeftPush("votes", pendingPushBack);
+                            pendingPushBack = null;
+                        }
+
+                        stage = "db";
+                        if (dbStale || pgsql == null || pgsql.State != ConnectionState.Open)
+                        {
+                            DisposeQuietly(pgsql);
+                            pgsql = OpenDbConnection(pgConnectionString);
+                            dbStale = false;
+                        }
+
+                        stage = "redis";
+                        json = redis!.ListLeftPop("votes");
+                    }
+                    catch (Exception ex)
+                    {
+                        if (stage == "db")
+                        {
+                            dbStale = true;
+                            Console.WriteLine("Reconnecting DB");
+                        }
+                        else
+                        {
+                            redisStale = true;
+                            Console.WriteLine("Reconnecting Redis");
+                        }
+                        Console.Error.WriteLine($"{stage} failed: {ex.GetType().Name}: {ex.Message}");
+                        Thread.Sleep(1000);
+                        continue;
                     }
 
-                    string json = redis.ListLeftPopAsync("votes").Result;
-
-                    if (json != null)
+                    if (json == null)
                     {
-                        var vote = JsonConvert.DeserializeAnonymousType(json, definition);
-                        Console.WriteLine(
-                            $"Processing vote for '{vote.vote}' by '{vote.voter_id}'");
-
-                        // Retry the vote operation if PostgreSQL fails.
-                        ExecuteWithDbRetry(
-                            ref pgsql,
-                            pgConnectionString,
-                            connection => UpdateVote(
-                                connection, vote.voter_id, vote.vote));
+                        try
+                        {
+                            using var keepAlive = pgsql!.CreateCommand();
+                            keepAlive.CommandText = "SELECT 1";
+                            keepAlive.ExecuteNonQuery();
+                        }
+                        catch (Exception ex)
+                        {
+                            dbStale = true;
+                            Console.WriteLine("Reconnecting DB");
+                            Console.Error.WriteLine($"Keep-alive failed: {ex.GetType().Name}: {ex.Message}");
+                            Thread.Sleep(1000);
+                        }
+                        continue;
                     }
-                    else
+
+                    var vote = JsonConvert.DeserializeAnonymousType(json, definition);
+                    Console.WriteLine($"Processing vote for '{vote.vote}' by '{vote.voter_id}'");
+
+                    try
                     {
-                        // Keep the connection alive and reconnect if failover
-                        // has made the existing connection unusable.
-                        ExecuteWithDbRetry(
-                            ref pgsql,
-                            pgConnectionString,
-                            connection =>
-                            {
-                                using (var command = connection.CreateCommand())
-                                {
-                                    command.CommandText = "SELECT 1";
-                                    command.ExecuteNonQuery();
-                                }
-                            });
+                        if (votingMode == "one-per-voter")
+                        {
+                            ReplaceVote(pgsql!, vote.voter_id, vote.vote);
+                        }
+                        else
+                        {
+                            UpdateVote(pgsql!, vote.voter_id, vote.vote);
+                        }
+                        lastFailedVote = null;
+                        strikes = 0;
+                    }
+                    catch (PostgresException ex) when (IsBadData(ex))
+                    {
+                        // Postgres refused the vote itself, so retrying cannot help
+                        Console.Error.WriteLine($"Dropping vote by '{vote.voter_id}': {ex.SqlState} {ex.Message}");
+                        lastFailedVote = null;
+                        strikes = 0;
+                    }
+                    catch (Exception ex)
+                    {
+                        // The connection is the likely cause. Put the vote back and reconnect,
+                        // but give up on a vote that fails MaxStrikes times in a row.
+                        strikes = json == lastFailedVote ? strikes + 1 : 1;
+                        lastFailedVote = json;
+                        dbStale = true;
+                        Console.WriteLine("Reconnecting DB");
+                        Console.Error.WriteLine($"Storing vote failed ({strikes} of {MaxStrikes}): {ex.GetType().Name}: {ex.Message}");
+                        if (strikes >= MaxStrikes)
+                        {
+                            Console.Error.WriteLine($"Dropping vote by '{vote.voter_id}' after {MaxStrikes} failures");
+                            lastFailedVote = null;
+                            strikes = 0;
+                        }
+                        else
+                        {
+                            pendingPushBack = json;
+                        }
+                        Thread.Sleep(1000);
                     }
                 }
             }
@@ -175,12 +262,19 @@ namespace Worker
 
             Console.Error.WriteLine("Connected to db");
 
-            using (var command = connection.CreateCommand())
+            try
             {
+                var command = connection.CreateCommand();
                 command.CommandText = @"CREATE TABLE IF NOT EXISTS votes (
-                    id VARCHAR(255) NOT NULL UNIQUE,
-                    vote VARCHAR(255) NOT NULL)";
+                                            id VARCHAR(255) NOT NULL,
+                                            vote VARCHAR(255) NOT NULL
+                                        )";
                 command.ExecuteNonQuery();
+            }
+            catch
+            {
+                connection.Dispose();
+                throw;
             }
 
             return connection;
@@ -188,18 +282,17 @@ namespace Worker
 
         private static ConnectionMultiplexer OpenRedisConnection(string hostname)
         {
-            // Use IP address to workaround https://github.com/StackExchange/StackExchange.Redis/issues/410
-            var ipAddress = GetIp(hostname);
-            Console.WriteLine($"Found redis at {ipAddress}");
-
             while (true)
             {
                 try
                 {
+                    // Use IP address to workaround https://github.com/StackExchange/StackExchange.Redis/issues/410
+                    var ipAddress = GetIp(hostname);
+                    Console.WriteLine($"Found redis at {ipAddress}");
                     Console.Error.WriteLine("Connecting to redis");
                     return ConnectionMultiplexer.Connect(ipAddress);
                 }
-                catch (RedisConnectionException)
+                catch (Exception ex) when (ex is RedisConnectionException || ex is SocketException || ex is InvalidOperationException)
                 {
                     Console.Error.WriteLine("Waiting for redis");
                     Thread.Sleep(1000);
@@ -208,30 +301,70 @@ namespace Worker
         }
 
         private static string GetIp(string hostname)
-            => Dns.GetHostEntryAsync(hostname)
-                .Result
+            => Dns.GetHostEntry(hostname)
                 .AddressList
                 .First(a => a.AddressFamily == AddressFamily.InterNetwork)
                 .ToString();
 
-        private static void UpdateVote(
-                NpgsqlConnection connection,
-                string voterId,
-                string vote)
+        // Class 22 (data exception) and 23 (integrity violation): the vote itself is bad
+        private static bool IsBadData(PostgresException ex)
+            => ex.SqlState.StartsWith("22", StringComparison.Ordinal) || ex.SqlState.StartsWith("23", StringComparison.Ordinal);
+
+        private static void DisposeQuietly(IDisposable? resource)
+        {
+            try
             {
-                using (var command = connection.CreateCommand())
-                {
-                    command.CommandText = @"
-                        INSERT INTO votes (id, vote)
-                        VALUES (@id, @vote)
-                        ON CONFLICT (id)
-                        DO UPDATE SET vote = EXCLUDED.vote";
-
-                    command.Parameters.AddWithValue("@id", voterId);
-                    command.Parameters.AddWithValue("@vote", vote);
-
-                    command.ExecuteNonQuery();
-                }
+                resource?.Dispose();
             }
+            catch (Exception)
+            {
+            }
+        }
+
+        private static void UpdateVote(NpgsqlConnection connection, string voterId, string vote)
+        {
+            var command = connection.CreateCommand();
+            try
+            {
+                command.CommandText = "INSERT INTO votes (id, vote) VALUES (@id, @vote)";
+                command.Parameters.AddWithValue("@id", voterId);
+                command.Parameters.AddWithValue("@vote", vote);
+                command.ExecuteNonQuery();
+            }
+            catch (DbException)
+            {
+                command.CommandText = "UPDATE votes SET vote = @vote WHERE id = @id";
+                // No row to update means the vote was not stored: let the caller see the original error
+                if (command.ExecuteNonQuery() == 0) throw;
+            }
+            finally
+            {
+                command.Dispose();
+            }
+        }
+
+        private static void ReplaceVote(NpgsqlConnection connection, string voterId, string vote)
+        {
+            using var transaction = connection.BeginTransaction();
+
+            using (var delete = connection.CreateCommand())
+            {
+                delete.Transaction = transaction;
+                delete.CommandText = "DELETE FROM votes WHERE id = @id";
+                delete.Parameters.AddWithValue("@id", voterId);
+                delete.ExecuteNonQuery();
+            }
+
+            using (var insert = connection.CreateCommand())
+            {
+                insert.Transaction = transaction;
+                insert.CommandText = "INSERT INTO votes (id, vote) VALUES (@id, @vote)";
+                insert.Parameters.AddWithValue("@id", voterId);
+                insert.Parameters.AddWithValue("@vote", vote);
+                insert.ExecuteNonQuery();
+            }
+
+            transaction.Commit();
+        }
     }
 }

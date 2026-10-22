@@ -14,7 +14,7 @@ The voting application includes:
 
 - **Vote (Python)**: A Python Flask-based web application where users can vote between two options.
 - **Redis (in-memory queue)**: Collects incoming votes and temporarily stores them.
-- **Worker (.NET)**: A .NET 7.0-based service that consumes votes from Redis and persists them into a database.
+- **Worker (.NET)**: A .NET 10-based service that consumes votes from Redis and persists them into a database.
 - **Postgres (Database)**: Stores votes for long-term persistence.
 - **Result (Node.js)**: A Node.js/Express web application that displays the vote counts in real time.
 
@@ -35,14 +35,14 @@ By dealing with this “messy” environment, you’ll build real-world problem-
 
 ### Running the Vote Service (Python) Locally (No Docker)
 
-1. Ensure you have Python 3.10+ installed.
+1. Ensure you have Python 3.15 installed (the version the Docker image uses).
 2. Navigate to the `vote` directory:
    ```bash
    cd vote
    pip install -r requirements.txt
-   python app.py
+   PORT=8000 python app.py
    ```
-   Access the vote interface at [http://localhost:5000](http://localhost:5000).
+   Access the vote interface at [http://localhost:8000](http://localhost:8000). The app listens on port 80 unless `PORT` is set, and on Linux ports below 1024 normally need root.
 
 ### Running Redis Locally (No Docker)
 
@@ -55,7 +55,7 @@ By dealing with this “messy” environment, you’ll build real-world problem-
 
 ### Running the Worker (C#/.NET) Locally (No Docker)
 
-1. Ensure .NET 7.0 SDK is installed.
+1. Ensure the .NET 10 SDK is installed (the version the Docker image uses).
 2. Navigate to `worker`:
    ```bash
    cd worker
@@ -114,7 +114,7 @@ You can build each service with Docker and run them individually:
   
 - **Postgres**:
   ```bash
-  docker run --name db -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD=postgres -p 5432:5432 postgres:15-alpine
+  docker run --name db -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD=postgres -p 5432:5432 postgres:18-alpine
   ```
 
 - **Result (Node.js)**:
@@ -126,6 +126,8 @@ You can build each service with Docker and run them individually:
 
 ### Using Docker Compose
 
+Before the first start, create a file named `.env` next to `docker-compose.yml` with one line, `DB_PASSWORD=` followed by a password of your choice (letters and digits only). Save it as plain text with exactly that name. Do not commit this file. Compose will not start without it, and to change the password later run `docker compose down -v` first.
+
 The easiest way to run the entire stack is via Docker Compose. From the project root directory:
 
 ```bash
@@ -134,7 +136,7 @@ docker compose up
 
 This will:
 
-- Build and run the vote, worker, and result services.
+- Pull the prebuilt `pokfinner/vote`, `pokfinner/result` and `pokfinner/worker` images and run them. To run your own code instead, uncomment the `build:` lines in `docker-compose.yml`, indent them to line up with `image:`, and start with `docker compose up --build`.
 - Run Redis and Postgres from their official images.
 - Set up networks, volumes, and environment variables so all services can communicate.
 
